@@ -13,7 +13,7 @@ class Encoder:
         self.state_dim, self.action_dim, self.zs_dim, self.za_dim, self.zsa_dim, self.out_dim, self.num_bins = state_dim, action_dim, zs_dim, za_dim, zsa_dim, out_dim, num_bins
         self.key = key
 
-        self.state_action_encoder = State_Action_Encoder(action_dim, za_dim, zsa_dim, out_dim, num_bins)
+        self.state_action_encoder = State_Action_Encoder(action_dim, za_dim, zs_dim, zsa_dim, out_dim, num_bins)
         self.state_encoder = State_Enoder(state_dim, zs_dim)
 
     # ── forward ────────────────────────────────────────────────────────────
@@ -24,6 +24,13 @@ class Encoder:
         d, r, zs_prime, zsa = self.state_action_encoder(zs, action)
 
         return zs, d, r, zs_prime, zsa
+    
+    @jax.jit
+    def get_MDP(self, zs, action):
+
+        d, r, zs_prime, zsa = self.state_action_encoder(zs, action)
+
+        return d, r, zs_prime, zsa
     
     @jax.jit
     def get_zs(self, state):

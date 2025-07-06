@@ -8,6 +8,7 @@ import optax
 from flax.training import checkpoints
 from pathlib import Path
 import math
+import copy
 
 # qpos is [ballxyz, ballquat, paddelxyz]
 class MRQ:
@@ -18,15 +19,15 @@ class MRQ:
         self.value_2 = value_2
         self.policy = policy
 
-        self.target_encoder = encoder
-        self.target_value_1 = value_1
-        self.target_value_2 = value_2
-        self.target_policy = policy
+        self.target_encoder = copy.deepcopy(encoder)
+        self.target_value_1 = copy.deepcopy(value_1)
+        self.target_value_2 = copy.deepcopy(value_2)
+        self.target_policy  = copy.deepcopy(policy)
 
         self.Sim = Sim
         self.key = key
 
-        self.gamma = .9
+        self.gamma = .99
         self.llambda = .99
         self.replay_buffer_capacity = 1000000
 
@@ -41,7 +42,7 @@ class MRQ:
         # In your PPO __init__
         initial_lr = 3e-5
 
-        self.steps = 3000
+        self.steps = 415
 
         self.epochs=200
         self.target_sync_every = 10
@@ -52,7 +53,9 @@ class MRQ:
 
         self.capacity = math.ceil(1_000_000 / (self.steps * self.Sim.cfg.batch))
         print(self.capacity)
-        self.buffer = [None] * self.capacity
+        self.buffer = None          # will be allocated after the first rollout
+        self.ptr     = 0            # circular index
+        self.filled  = 0            # number of valid trajs in the buffer
 
         
         self.policy_opt = optax.chain(
@@ -154,11 +157,13 @@ class MRQ:
             noise_qvel = jnp.zeros_like(next_state.qvel).at[:, :3].set(noise_qvel) * done[:, None]
             next_state = SimData(noise_qpos + next_state.qpos, noise_qvel + next_state.qvel)
 
-            return (next_state, key, action), (s, action, r, done, next_state)
+            next_s = self.Sim.getObs(next_state)
+
+            return (next_state, key, action), (s, action, r, done, next_s)
         
         prev_ctrl = jnp.zeros((state.qpos.shape[0], 3))
         
-        (state, key, _), (s, action, r, done, next_state) = jax.lax.scan(_rollout, (state, key, prev_ctrl), None, length=self.steps)
+        (state, key, _), (s, action, r, done, next_s) = jax.lax.scan(_rollout, (state, key, prev_ctrl), None, length=self.steps)
         # log_probs_old (T, B)
         # states (T, B, 19)
         # rewards (T, B)
@@ -178,19 +183,20 @@ class MRQ:
             "actions": jax.lax.stop_gradient(action),
             "rewards": jax.lax.stop_gradient(r),
             "dones": jax.lax.stop_gradient(done),
-            "next_states": jax.lax.stop_gradient(next_state),
+            "next_states": jax.lax.stop_gradient(next_s),
         }
 
         return Batch, key
     
     @staticmethod
-    @jax.jit
-    def loss_fn_encoder(target_encoder, encoder, sup_episode, bins): # Work in (T, B, ..)
+    @partial(jax.jit, static_argnums=(3,))
+    def loss_fn_encoder(target_encoder, encoder, sup_episode, bins: int): # Work in (T, B, ..)
         
         states, actions, rewards, dones, next_states = sup_episode["states"], sup_episode["actions"], sup_episode["rewards"], sup_episode["dones"], sup_episode["next_states"]
 
-        cumprod = jnp.cumprod(1.0 - dones, axis=0, exclusive=True)
-        mask    = cumprod[..., None]
+        inclusive = jnp.cumprod(1.0 - dones, axis=0)
+        cumprod   = jnp.concatenate([jnp.ones_like(inclusive[:1]), inclusive[:-1]], axis=0)
+        mask      = cumprod[..., None]
 
         T = states.shape[0]
 
@@ -205,14 +211,16 @@ class MRQ:
             zs = carry
             action = xs
 
-            _, d, r, zs_prime, _ = encoder(zs, action)
+            d, r, zs_prime, _ = encoder.get_MDP(zs, action)
 
             return zs_prime, (zs_prime, r, d)
         
         zs, (zs_primes, rs, ds) = jax.lax.scan(_get_loss_values, zs_0, actions, length=T)
 
         # Reward Loss
-        arange     = jnp.arange(-bins//2, bins//2)
+        lower = -((bins - 1) // 2)
+        upper = ((bins - 1) // 2) + 1
+        arange     = jnp.arange(lower, upper)
         bin_values = jnp.abs(arange)/arange * (jnp.exp(jnp.abs(arange)) - 1)
         bin_values = jnp.nan_to_num(bin_values, nan=0.0)
         idxs = jnp.searchsorted(bin_values, rewards)
@@ -225,11 +233,11 @@ class MRQ:
         alpha = (upper_values - rewards) / (upper_values - lower_values)
         beta = (rewards - lower_values) / (upper_values - lower_values)
 
-        batch_idx      = jnp.arange(rs.shape[0]) 
-        log_probs_lower = rs[batch_idx, lower_idxs]
-        log_probs_upper = rs[batch_idx, upper_idxs]
+        log_probs_lower = jnp.take_along_axis(rs, lower_idxs[..., None], axis=-1)[..., 0]
+        log_probs_upper = jnp.take_along_axis(rs, upper_idxs[..., None], axis=-1)[..., 0]
 
-        reward_loss = jnp.mean(-(log_probs_lower * alpha + log_probs_upper * beta) * mask[:-1, :, 0])
+
+        reward_loss = jnp.mean(-(log_probs_lower * alpha + log_probs_upper * beta) * mask[:, :, 0])
 
         # Dynamics Loss
         states_no_state_0 = states[1:]
@@ -238,10 +246,10 @@ class MRQ:
         flat_zs_target = jax.lax.stop_gradient(target_encoder.get_zs(flat_states_no_state_0))
         zs_target = flat_zs_target.reshape(T-1, B, -1)
 
-        dynamics_loss = jnp.mean((zs_target - zs_primes)**2 * mask[1:, :, 0, None])
+        dynamics_loss = jnp.mean((zs_target - zs_primes[:-1])**2 * mask[1:, :, 0, None])
 
         # Terminal Loss
-        terminal_loss = jnp.mean((ds - dones)**2 * mask[:, :, 0])
+        terminal_loss = jnp.mean((ds - dones[..., None])**2 * mask[:, :, 0, None])
 
         loss = reward_loss * llamba_reward + dynamics_loss * llamba_dyamics + terminal_loss * llamaba_terminal
         return loss
@@ -281,7 +289,7 @@ class MRQ:
         target_value_2 = jax.lax.stop_gradient(target_value_Model_2(zsa))
         target_value = jnp.minimum(target_value_1, target_value_2) * target_r_avg
 
-        value_goal = (1 / r_avg) * (v + gamma**T * target_value * m)
+        value_goal = (1 / r_avg) * (v + gamma**(T -1) * target_value * m)
 
         value_predict_1 = value_Model_1(zsa)
         value_predict_2 = value_Model_2(zsa)
@@ -298,27 +306,22 @@ class MRQ:
         
         llamba_pre_act = 1e-5
 
-        mask = jnp.cumprod(1.0 - dones, axis=0, exclusive=True)
-        mask = mask[..., None]
+        inclusive = jnp.cumprod(1.0 - dones, axis=0)
+        cumprod   = jnp.concatenate([jnp.ones_like(inclusive[:1]), inclusive[:-1]], axis=0)
+        mask      = cumprod[..., None]
 
-        T, B, data_len = mask.shape
-        flat_masks = mask.reshape(T*B, -1)
-
-        T, B, data_len = states.shape
-        flat_states = states.reshape(T*B, -1)
-
-        flat_zs = encoder.get_zs(flat_states)
-        flat_action, flat_pre_act = policy_Model(flat_zs)
+        zs = encoder.get_zs(states)
+        action, pre_act = policy_Model(zs)
 
         # key, subkey = random.split(key)
         # action = random.normal(subkey, action.shape) * .1 + action
 
-        _, _, _, _, flat_zsa = encoder(flat_states, flat_action)
+        _, _, _, _, flat_zsa = encoder(states, action)
 
-        flat_value_1 = value_Model_1(flat_zsa)
-        flat_value_2 = value_Model_2(flat_zsa)
+        value_1 = value_Model_1(flat_zsa)
+        value_2 = value_Model_2(flat_zsa)
 
-        loss = jnp.mean((-0.5 * (flat_value_1 + flat_value_2) + llamba_pre_act * (flat_pre_act**2).mean(axis=-1, keepdims=True)) * flat_masks) 
+        loss = jnp.mean((-0.5 * (value_1 + value_2) + llamba_pre_act * (pre_act**2).mean(axis=-1, keepdims=True)) * mask) 
 
         
         return loss
@@ -328,91 +331,115 @@ class MRQ:
 
         
         def _pick(bi, ti, ei, field):
-            return self.buffer[bi][field][ti, ei]  
+            arr = self.buffer[field]                      
+            starts      = (bi, ti, ei) + (0,) * (arr.ndim - 3)
+            slice_sizes = (1, 1, 1) + arr.shape[3:]
+            out = jax.lax.dynamic_slice(arr, starts, slice_sizes)
+            return out[0, 0, 0]                             
 
         def _window(bi, ti, ei, field, H):
-            return self.buffer[bi][field][ti : ti+H, ei]    
+            arr = self.buffer[field]                      
+            starts      = (bi, ti, ei) + (0,) * (arr.ndim - 3)
+            slice_sizes = (1, H, 1) + arr.shape[3:]
+            window = jax.lax.dynamic_slice(arr.swapaxes(1,0), (ti, bi, ei) + (0,)*(arr.ndim-3), (H,1,1)+arr.shape[3:])
+            return window[:, 0, 0]                        
 
         def _sample_step(rng, N):
             T, B = self.steps, self.Sim.cfg.batch
-            rng, a = random.split(rng); buf = random.randint(a, (N,), 0, self.capacity)
-            rng, b = random.split(rng); t   = random.randint(b, (N,), 0, T)
-            rng, c = random.split(rng); env = random.randint(c, (N,), 0, B)
+            rng, a = random.split(rng)
+            buf = random.randint(a, (N,), 0, max(self.filled, 1))
+            rng, b = random.split(rng)
+            t   = random.randint(b, (N,), 0, T)
+            rng, c = random.split(rng)
+            env = random.randint(c, (N,), 0, B)
             g = jax.vmap(lambda bi, ti, ei, k: _pick(bi,ti,ei,k), in_axes=(0,0,0,None))
             return {k: g(buf,t,env,k) for k in ["states","actions","rewards","dones","next_states"]}, rng
 
         def _sample_window(rng, N, H):
             T, B = self.steps, self.Sim.cfg.batch
-            rng, a = random.split(rng); buf = random.randint(a, (N,), 0, self.capacity)
-            rng, b = random.split(rng); t   = random.randint(b, (N,), 0, T-H+1)
-            rng, c = random.split(rng); env = random.randint(c, (N,), 0, B)
+            rng, a = random.split(rng)
+            buf = random.randint(a, (N,), 0, max(self.filled, 1))
+            rng, b = random.split(rng)
+            t   = random.randint(b, (N,), 0, T-H+1)
+            rng, c = random.split(rng)
+            env = random.randint(c, (N,), 0, B)
             g = jax.vmap(lambda bi, ti, ei, k: _window(bi,ti,ei,k,H), in_axes=(0,0,0,None))
             return {k: g(buf,t,env,k) for k in ["states","actions","rewards","dones","next_states"]}, rng
 
         def _mean_abs_reward():
-            tot, n = 0.0, 0
-            for slot in self.buffer:
-                r = slot["rewards"]
-                tot += jnp.abs(r).sum()
-                n += r.size
-            return float(tot/n)
+            r = self.buffer["rewards"][:self.filled]        # only valid entries
+            return float(jnp.abs(r).mean())
 
         
-        enc_grad = jax.jit(jax.value_and_grad(self.loss_fn_encoder))
+        enc_grad = jax.jit(jax.value_and_grad(self.loss_fn_encoder, argnums=1), static_argnums=(3,))
         val_grad = jax.jit(jax.value_and_grad(self.loss_fn_value, argnums=(0,1)))
-        pi_grad  = jax.jit(jax.value_and_grad(self.loss_fn_policy))
+        policy_grad  = jax.jit(jax.value_and_grad(self.loss_fn_policy, argnums=0))
 
         
-        ptr = 0
-        while ptr < self.capacity:
-            batch, self.key = self.rollout(self.encoder, self.policy, self.key)
-            self.buffer[ptr] = batch
-            ptr += 1
+
+        warmup_batch, self.key = self.rollout(self.encoder, self.policy, self.key)
+        if self.buffer is None:
+            T, B, obs_dim  = warmup_batch["states"].shape
+            act_dim        = warmup_batch["actions"].shape[-1]
+            self.buffer = {
+                "states":       jnp.empty((self.capacity, T, B, obs_dim),  dtype=jnp.float32),
+                "actions":      jnp.empty((self.capacity, T, B, act_dim),  dtype=jnp.float32),
+                "rewards":      jnp.empty((self.capacity, T, B),           dtype=jnp.float32),
+                "dones":        jnp.empty((self.capacity, T, B),           dtype=jnp.float32),
+                "next_states":  jnp.empty((self.capacity, T, B, obs_dim),  dtype=jnp.float32),
+            }
+        # write the warm‑up batch in slot 0
+        for k in self.buffer:
+            self.buffer[k] = self.buffer[k].at[0].set(warmup_batch[k])
+        self.ptr    = 1
+        self.filled = 1
 
         target_r_avg = r_avg = _mean_abs_reward()
-
        
         for epoch in range(self.epochs):
 
             batch, self.key = self.rollout(self.encoder, self.policy, self.key)
-            self.buffer[ptr] = batch
-            ptr = (ptr + 1) % self.capacity
+            idx = self.ptr % self.capacity
+            for k in self.buffer:
+                self.buffer[k] = self.buffer[k].at[idx].set(batch[k])
+            self.ptr    += 1
+            self.filled  = min(self.filled + 1, self.capacity)
 
             for _ in range(self.updates_per_epoch):
 
                 # Encoder
+                bins_int = int(self.num_bins)  
                 enc_sup, self.key = _sample_window(self.key, self.minibatch_size, self.horizon_enc+1)
-                enc_loss, enc_gr  = enc_grad(self.target_encoder, self.encoder, enc_sup, self.num_bins)
-                upd, self.encoder_opt_state = self.encoder_opt.update(enc_gr, self.encoder_opt_state)
+                enc_loss, enc_gr  = enc_grad(self.target_encoder, self.encoder, enc_sup, bins=bins_int)
+                upd, self.encoder_opt_state = self.encoder_opt.update(enc_gr, self.encoder_opt_state, params=self.encoder)               
                 self.encoder = optax.apply_updates(self.encoder, upd)
 
                 # Critics
-                val_sup, self.key = _sample_window(self.key, self.minibatch_size,
-                                                self.horizon_Q+1)
-                (vl1, vl2), (g1,g2) = val_grad(self.value_1, self.value_2, self.target_value_1, self.target_value_2, self.target_encoder, self.target_policy, target_r_avg, r_avg, val_sup, self.key)
-                upd1, self.value_1_opt_state = self.value_1_opt.update(g1, self.value_1_opt_state)
-                upd2, self.value_2_opt_state = self.value_2_opt.update(g2, self.value_2_opt_state)
+                val_sup, self.key = _sample_window(self.key, self.minibatch_size, self.horizon_Q+1)
+                val_loss, (g1,g2) = val_grad(self.value_1, self.value_2, self.target_value_1, self.target_value_2, self.target_encoder, self.target_policy, target_r_avg, r_avg, val_sup, self.key)
+                upd1, self.value_1_opt_state = self.value_1_opt.update(g1, self.value_1_opt_state, params=self.value_1)
+                upd2, self.value_2_opt_state = self.value_2_opt.update(g2, self.value_2_opt_state, params=self.value_2)
                 self.value_1 = optax.apply_updates(self.value_1, upd1)
                 self.value_2 = optax.apply_updates(self.value_2, upd2)
 
                 # Policy
                 policy_sup, self.key = _sample_step(self.key, self.minibatch_size)
-                policy_loss, policy_gr = pi_grad(self.policy, self.value_1, self.value_2, self.encoder, policy_sup, self.key)
-                upd, self.policy_opt_state = self.policy_opt.update(policy_gr, self.policy_opt_state)
+                policy_loss, policy_gr = policy_grad(self.policy, self.value_1, self.value_2, self.encoder, policy_sup, self.key)
+                upd, self.policy_opt_state = self.policy_opt.update(policy_gr, self.policy_opt_state, params=self.policy)
                 self.policy = optax.apply_updates(self.policy, upd)
 
             # (c) Sync target nets every target_sync_every epochs
             if (epoch + 1) % self.target_sync_every == 0:
-                self.target_encoder = self.encoder
-                self.target_value_1 = self.value_1
-                self.target_value_2 = self.value_2
-                self.target_policy  = self.policy
+                self.target_encoder = copy.deepcopy(self.encoder)
+                self.target_value_1 = copy.deepcopy(self.value_1)
+                self.target_value_2 = copy.deepcopy(self.value_2)
+                self.target_policy  = copy.deepcopy(self.policy)
                 target_r_avg, r_avg = r_avg, _mean_abs_reward()
 
             # (d) Logging
             mean_r = batch["rewards"].mean().item()
             print(f"epoch {epoch:4d} | R̄={mean_r:6.3f}  "
-                f"enc={enc_loss:6.4f} v={vl1:6.4f} pi={policy_loss:6.4f}")
+                f"enc={enc_loss:6.4f} v={val_loss:6.4f} pi={policy_loss:6.4f}")
 
         # ------------------------------------------------------------------
         # 2.  Save models at the end
