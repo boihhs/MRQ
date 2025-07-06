@@ -12,36 +12,35 @@ from pynput import keyboard
 import numpy as np
 import jax, jax.numpy as jnp
 from flax.training import checkpoints
-from jax_mujoco_2.policy import Policy   # ← your MLP definition
 
 XML_PATH = "env_ping_pong.xml"
-CKPT_DIR = Path("jax_mujoco_2").absolute() / "checkpoints"
-CKPT_PREFIX = "policy_"            # adjust if you used a different prefix
+# CKPT_DIR = Path("jax_mujoco_2").absolute() / "checkpoints"
+# CKPT_PREFIX = "policy_"            # adjust if you used a different prefix
 DT_TARGET = 1.0 / 60.0             # 60 FPS
 
 # ── 0. MuJoCo sizes ────────────────────────────────────────────────────────
 mj_model = mujoco.MjModel.from_xml_path(XML_PATH)
 nq, nv, nu = mj_model.nq, mj_model.nv, mj_model.nu
 
-policy          = Policy(19, 6)
-params_template = policy                      # no .init needed
+# policy          = Policy(19, 6)
+# params_template = policy                      # no .init needed
 
-ckpt_path = checkpoints.latest_checkpoint(CKPT_DIR, prefix=CKPT_PREFIX)
-if ckpt_path:
-    params = checkpoints.restore_checkpoint(ckpt_path, target=params_template)
-    step   = int(re.search(r"_([0-9]+)$", ckpt_path).group(1))
-    print(f"✓ loaded step {step} from {ckpt_path}")
-else:
-    print("[WARN] no checkpoint found; using random weights.")
-    params = params_template
+# ckpt_path = checkpoints.latest_checkpoint(CKPT_DIR, prefix=CKPT_PREFIX)
+# if ckpt_path:
+#     params = checkpoints.restore_checkpoint(ckpt_path, target=params_template)
+#     step   = int(re.search(r"_([0-9]+)$", ckpt_path).group(1))
+#     print(f"✓ loaded step {step} from {ckpt_path}")
+# else:
+#     print("[WARN] no checkpoint found; using random weights.")
+#     params = params_template
 
-@jax.jit
-def act_fn(model, obs, key):
-    ctrls, stds  = model(obs[None, :], key)     # remove batch dim
-    return ctrls[0], stds[0]                   # deterministic mean action
+# @jax.jit
+# def act_fn(model, obs, key):
+#     ctrls, stds  = model(obs[None, :], key)     # remove batch dim
+#     return ctrls[0], stds[0]                   # deterministic mean action
 
-from jax import random
-key = random.PRNGKey(0)
+# from jax import random
+# key = random.PRNGKey(0)
 # ── 4. Keys for manual overrides (optional) ────────────────────────────────
 pressed_keys = set()
 def on_press(key):
@@ -78,48 +77,48 @@ with viewer.launch_passive(mj_model, mj_data) as v:
         sim_t0 = mj_data.time
         while (mj_data.time - sim_t0) < DT_TARGET:
             # 1. observation
-            qpos = jnp.asarray(np.copy(mj_data.qpos), dtype=jnp.float32)
-            qvel = jnp.asarray(np.copy(mj_data.qvel), dtype=jnp.float32)
-            obs  = jnp.concatenate([qpos, qvel])
+            # qpos = jnp.asarray(np.copy(mj_data.qpos), dtype=jnp.float32)
+            # qvel = jnp.asarray(np.copy(mj_data.qvel), dtype=jnp.float32)
+            # obs  = jnp.concatenate([qpos, qvel])
 
-            # 2. policy → control
-            key, subkey = random.split(key)
-            subkeys = random.split(subkey, 1)
-            ctrls, stds = params.inference((obs[None, :]))
-            ctrls, stds = ctrls[0], stds[0]
+            # # 2. policy → control
+            # key, subkey = random.split(key)
+            # subkeys = random.split(subkey, 1)
+            # ctrls, stds = params.inference((obs[None, :]))
+            # ctrls, stds = ctrls[0], stds[0]
 
-            dist_paddle_ball = jnp.exp(-2*jnp.linalg.norm(jnp.array([0, 0, 2]) - jnp.array(mj_data.qpos[7:])))
-            # print(dist_paddle_ball)
+            # dist_paddle_ball = jnp.exp(-2*jnp.linalg.norm(jnp.array([0, 0, 2]) - jnp.array(mj_data.qpos[7:])))
+            # # print(dist_paddle_ball)
             
-            ncon = mj_data.ncon                          
+            # ncon = mj_data.ncon                          
 
-            c = mj_data.contact
-            # print(c[:ncon].dist)
-            # print(c.dist)
+            # c = mj_data.contact
+            # # print(c[:ncon].dist)
+            # # print(c.dist)
 
-            geom1 = c.geom1[:ncon] 
-            geom2 = c.geom2[:ncon]  
-            # print(geom1)         
-            # print(geom2)             
+            # geom1 = c.geom1[:ncon] 
+            # geom2 = c.geom2[:ncon]  
+            # # print(geom1)         
+            # # print(geom2)             
 
-            mask_pb = (geom1 == paddle_id) & (geom2 == ball_id) | (geom1 == ball_id)   & (geom2 == paddle_id)
-            hit_pb = jnp.any(mask_pb) 
-            mask_tb = (geom1 == table_id) & (geom2 == ball_id) | (geom1 == ball_id)   & (geom2 == table_id)
-            hit_tb = jnp.any(mask_tb) 
-            if (hit_pb):
-                print(hit_pb)
+            # mask_pb = (geom1 == paddle_id) & (geom2 == ball_id) | (geom1 == ball_id)   & (geom2 == paddle_id)
+            # hit_pb = jnp.any(mask_pb) 
+            # mask_tb = (geom1 == table_id) & (geom2 == ball_id) | (geom1 == ball_id)   & (geom2 == table_id)
+            # hit_tb = jnp.any(mask_tb) 
+            # if (hit_pb):
+            #     print(hit_pb)
 
             
-            mj_data.ctrl[:] = np.asarray(ctrls, dtype=np.float64)
-            d = jnp.linalg.norm(mj_data.qpos[7:] - mj_data.qpos[:3])
-            if d < .06:
-                print(d)
-            # if(mj_data.ncon == 1):
-            #     print("contact")
-            #     print(mj_data.contact)
-            #     print("\n\n")
-            print("control")
-            print(mj_data.ctrl)
+            # mj_data.ctrl[:] = np.asarray(ctrls, dtype=np.float64)
+            # d = jnp.linalg.norm(mj_data.qpos[7:] - mj_data.qpos[:3])
+            # if d < .06:
+            #     print(d)
+            # # if(mj_data.ncon == 1):
+            # #     print("contact")
+            # #     print(mj_data.contact)
+            # #     print("\n\n")
+            # print("control")
+            # print(mj_data.ctrl)
             # print("std")
             # print(stds)
 
@@ -140,6 +139,6 @@ with viewer.launch_passive(mj_model, mj_data) as v:
         # if (mj_data.qpos[2] < 0.5) or (time.time() - episode_start > 5):
         #     mujoco.mj_resetDataKeyframe(mj_model, mj_data, kf_id)
         #     episode_start = time.time()
-        if (time.time() - episode_start > 20):
+        if (time.time() - episode_start > 4):
             mujoco.mj_resetDataKeyframe(mj_model, mj_data, kf_id)
             episode_start = time.time()

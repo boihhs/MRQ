@@ -1,0 +1,125 @@
+<?xml version="1.0"?>
+<mujoco model="table_tennis">
+
+
+  <!--   COMPILATION & GLOBAL OPTIONS   -->
+  <compiler angle="degree" coordinate="local" inertiafromgeom="true"/>
+  <option timestep="0.0005" integrator="Euler"
+        solver="Newton"
+        iterations="20"
+        tolerance="1e-8"
+        gravity="0 0 -9.81"
+        density="1.225" viscosity="1.8e-5" wind="0 0 0"/>
+  <size njmax="500" nconmax="200"/>
+
+  <visual>
+    <global offwidth="1280" offheight="720"/>
+  </visual>
+
+
+  <!--   DEFAULTS (root then specialised)   -->
+  <default>
+    <!-- Ball-specific defaults -->
+    <default class="ball">
+      <joint type="free" damping="0.002"/>
+      <geom type="sphere" size="0.02" mass="0.0027"
+            rgba="1 0.6 0.3 1"
+            solref="-1e6 -17"
+            solimp="0.98 0.99 0.001 0.5 2"
+            friction="0.1 0.1 0.005"
+            fluidshape="ellipsoid"
+            fluidcoef="0.235 0.25 0 1 1"/>
+    </default>
+
+    <!-- Paddle-specific defaults -->
+    <default class="paddle">
+      <geom type="box" size="0.075 0.075 0.005" density="700"
+            rgba="0.25 0.25 0.25 1"
+            solref="-2.68072e5 -103"
+            solimp="1.0 0.95 0.001 1.0 6"
+            friction="1.5 1.5 0.005"/>
+    </default>
+
+
+  </default>
+
+  <!--   WORLD GEOMETRY   -->
+  <worldbody>
+
+    <body name="light_base" pos="0 0 3">
+      <light name="top_light"
+            mode="track"          
+            directional="false"
+            diffuse="1 1 1"
+            specular="0.3 0.3 0.3"
+            ambient="0.3 0.3 0.3"
+            attenuation="1 0 0"
+            castshadow="true"/>
+   </body>
+    <geom name="ground" type="plane" pos="0 0 0" size="0 0 0.1" rgba="0.8 0.9 0.8 1"/>
+
+    <body name="table" pos="0 0 0.745">
+      <geom name="table_top" type="box" size="1.37 0.7625 0.015" rgba="0.05 0.25 0.8 1"
+            friction="0.4 0.4 0.005"/>
+    </body>
+
+    <body name="net" pos="0 0 0.76">
+      <geom name="net_geom" type="box" size="0.005 0.7625 0.07625" rgba="0.2 0.8 0.2 0.7"
+            contype="1" conaffinity="1"/>
+    </body>
+
+    <!-- Ball -->
+    <body name="ball" pos="0 0 0">
+      <joint class="ball"/>
+      <geom name="ball_geom" class="ball"/>
+    </body>
+
+    <!-- Paddle (gravity compensated) -->
+    <body name="paddle_base" pos="0 0 0" gravcomp="1">
+      <!-- Joints apply here in world-aligned frame -->
+      <joint name="paddle_x" type="slide" axis="1 0 0" limited="true" range="-10 10" damping="1"/>
+      <joint name="paddle_y" type="slide" axis="0 1 0" limited="true" range="-10 10" damping="1"/>
+      <joint name="paddle_z" type="slide" axis="0 0 1" limited="true" range="-10 10" damping="1"/>
+
+      <!-- Nested body to hold rotated geometry -->
+      <body name="paddle" quat="0.7071 0.0 0.7071 0.0" gravcomp="1">
+        <geom name="paddle_face" class="paddle"/>
+      </body>
+    </body>
+
+
+    
+    <!-- <camera 
+      name="fixed_cam" 
+      mode="fixed" 
+     pos="0.109 -6.148 1.353" xyaxes="1.000 0.018 -0.000 -0.004 0.215 0.977"/> -->
+    <camera 
+      name="fixed_cam" 
+      mode="fixed" 
+      pos="-4.991 0.088 1.555" 
+      xyaxes="-0.018 -1.000 0.000 0.297 -0.005 0.955"/>
+  </worldbody>
+
+  <!--   CONTACT OVERRIDES   -->
+  <contact>
+    <pair geom1="ball_geom" geom2="table_top"
+          solref="-1e6 -17" solimp="0.98 0.99 0.001 0.5 2"
+          friction="0.1 0.1 0.005"/>
+    <pair geom1="ball_geom" geom2="paddle_face"
+          solref="-2.68072e5 -103" solimp="1.0 0.95 0.001 1.0 6"
+          friction="1.5 1.5 0.005"/>
+  </contact>
+
+  <actuator>
+    <velocity name="motor_paddle_x" joint="paddle_x" ctrlrange="-10 10" kv="1"/>
+    <velocity name="motor_paddle_y" joint="paddle_y" ctrlrange="-10 10" kv="1"/>
+    <velocity name="motor_paddle_z" joint="paddle_z" ctrlrange="-10 10" kv="1"/>
+  </actuator>
+
+  <keyframe>
+    <key qpos="3.5 0 1.3 1 0 0 0   -1.5 0 1"
+            qvel="-10 0 0 0 0 0   0 0 0"
+            name="serve"/>
+    </keyframe>
+
+</mujoco>
